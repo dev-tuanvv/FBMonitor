@@ -10,5 +10,25 @@
     "groupIds": [
         "vinfastevo200",
         "398556705791228"
-    ]
+    ],
+    "maxConcurrentTabs": 5,
+    "scrollConfig": {
+        "maxScrolls": 30,
+        "maxNoNewPosts": 3,
+        "scrollWaitMin": 2000,
+        "scrollWaitMax": 4000
+    },
+    "notification": {
+        "telegram": {
+            "enabled": false,
+            "botToken": "",
+            "chatId": ""
+        },
+        "zalo": {
+            "enabled": false,
+            "accessToken": "",
+            "groupId": "",
+            "webhookUrl": ""
+        }
+    }
 }
