@@ -17,6 +17,11 @@ class FacebookGroupMonitor {
     this.existingResults = new Map();
     this.maxConcurrentTabs = 5;
     this.notificationConfig = null;
+    this.groupStats = new Map(); // Lưu thống kê từng nhóm
+    this.progressFile = "scan_progress.json";
+    this.groupCooldownMinutes = 30; // Default cooldown
+    this.maxRetries = 2; // Default retries
+    this.batchDelayMs = 3000; // Default batch delay
     this.scrollConfig = {
       maxScrolls: 30, // Tối đa 30 lần scroll
       maxNoNewPosts: 3, // Dừng sau 3 lần scroll không thấy bài mới
@@ -201,6 +206,22 @@ class FacebookGroupMonitor {
           this.notificationConfig = config.notification;
         }
 
+        // Load performance config
+        if (config.performance) {
+          if (config.performance.maxConcurrentTabs) {
+            this.maxConcurrentTabs = config.performance.maxConcurrentTabs;
+          }
+          if (config.performance.groupCooldownMinutes) {
+            this.groupCooldownMinutes = config.performance.groupCooldownMinutes;
+          }
+          if (config.performance.maxRetries) {
+            this.maxRetries = config.performance.maxRetries;
+          }
+          if (config.performance.batchDelayMs) {
+            this.batchDelayMs = config.performance.batchDelayMs;
+          }
+        }
+
         console.log(
           `✅ Config: ${this.keywords.length} keywords, ${this.groupIds.length} groups`
         );
@@ -219,12 +240,18 @@ class FacebookGroupMonitor {
     const config = {
       keywords: ["mua", "bán", "cần tìm", "thanh lý", "ship cod", "giá rẻ"],
       groupIds: [],
-      maxConcurrentTabs: 5,
+      maxConcurrentTabs: 10, // Tăng lên 10 cho nhiều nhóm
       scrollConfig: {
         maxScrolls: 30,
         maxNoNewPosts: 3,
         scrollWaitMin: 2000,
         scrollWaitMax: 4000,
+      },
+      performance: {
+        maxConcurrentTabs: 10, // Số tabs đồng thời (khuyến nghị: 10-15)
+        groupCooldownMinutes: 30, // Skip nhóm đã quét trong X phút
+        maxRetries: 2, // Số lần retry khi lỗi
+        batchDelayMs: 3000, // Delay giữa các batch (ms)
       },
       notification: {
         telegram: {
@@ -236,6 +263,7 @@ class FacebookGroupMonitor {
           enabled: false,
           accessToken: "",
           groupId: "",
+          webhookUrl: "",
         },
       },
     };
@@ -263,6 +291,85 @@ class FacebookGroupMonitor {
 
     this.existingResults = new Map();
     return false;
+  }
+
+  // ========== LOAD/SAVE GROUP STATS ==========
+  async loadGroupStats() {
+    try {
+      if (await fs.pathExists(this.progressFile)) {
+        const data = await fs.readJson(this.progressFile);
+        this.groupStats = new Map(Object.entries(data.groupStats || {}));
+        console.log(`📊 Đã load stats cho ${this.groupStats.size} nhóm`);
+        return true;
+      }
+    } catch (error) {
+      console.error("⚠️ Lỗi load group stats:", error.message);
+    }
+    this.groupStats = new Map();
+    return false;
+  }
+
+  async saveGroupStats() {
+    try {
+      const data = {
+        lastUpdate: new Date().toISOString(),
+        groupStats: Object.fromEntries(this.groupStats),
+      };
+      await fs.writeJson(this.progressFile, data, { spaces: 2 });
+    } catch (error) {
+      console.error("⚠️ Lỗi save group stats:", error.message);
+    }
+  }
+
+  updateGroupStat(groupId, stat) {
+    const existing = this.groupStats.get(groupId) || {
+      lastScan: null,
+      lastNewPostCount: 0,
+      totalScans: 0,
+      errorCount: 0,
+    };
+
+    this.groupStats.set(groupId, {
+      ...existing,
+      ...stat,
+      lastScan: new Date().toISOString(),
+      totalScans: existing.totalScans + 1,
+    });
+  }
+
+  // ========== CHECK COOLDOWN ==========
+  shouldSkipGroup(groupId) {
+    const stat = this.groupStats.get(groupId);
+    if (!stat || !stat.lastScan) {
+      return false; // Chưa quét lần nào
+    }
+
+    const lastScanTime = new Date(stat.lastScan);
+    const now = new Date();
+    const minutesSinceLastScan = (now - lastScanTime) / (1000 * 60);
+
+    if (minutesSinceLastScan < this.groupCooldownMinutes) {
+      const remaining = Math.ceil(
+        this.groupCooldownMinutes - minutesSinceLastScan
+      );
+      return { skip: true, reason: `Cooldown còn ${remaining} phút` };
+    }
+
+    return { skip: false };
+  }
+
+  // ========== GET OPTIMIZED SCROLL CONFIG ==========
+  getScrollConfigForGroup(groupId) {
+    const stat = this.groupStats.get(groupId);
+    const baseConfig = { ...this.scrollConfig };
+
+    // Nếu nhóm không có bài mới lần trước, giảm scroll
+    if (stat && stat.lastNewPostCount === 0) {
+      baseConfig.maxScrolls = Math.max(10, baseConfig.maxScrolls - 10);
+      baseConfig.maxNoNewPosts = 2; // Dừng sớm hơn
+    }
+
+    return baseConfig;
   }
 
   mergeResult(newResult) {
@@ -450,8 +557,8 @@ class FacebookGroupMonitor {
     });
   }
 
-  // ========== QUÉT 1 NHÓM VỚI SMART SCROLL ==========
-  async scanGroupInTab(groupId, cookies, tabIndex) {
+  // ========== QUÉT 1 NHÓM VỚI SMART SCROLL (VỚI RETRY) ==========
+  async scanGroupInTab(groupId, cookies, tabIndex, retryCount = 0) {
     let page = null;
 
     try {
@@ -495,8 +602,10 @@ class FacebookGroupMonitor {
       // ========== SMART SCROLL LOOP ==========
       let noNewPostsCount = 0;
       let scrollCount = 0;
+      // Dùng scroll config tối ưu cho nhóm này
+      const scrollConfig = this.getScrollConfigForGroup(groupId);
       const { maxScrolls, maxNoNewPosts, scrollWaitMin, scrollWaitMax } =
-        this.scrollConfig;
+        scrollConfig;
 
       console.log(
         `[Tab ${tabIndex}] 🔄 Bắt đầu smart scroll (max: ${maxScrolls}, stop: ${maxNoNewPosts} lần không có mới)`
@@ -589,11 +698,31 @@ class FacebookGroupMonitor {
         `[Tab ${tabIndex}] ✅ Hoàn thành - Mới: ${newPosts.length}, Update: ${updatedPosts.length} (${scrollCount} scrolls, ${processedUrls.size} posts đã xem)`
       );
 
+      // Cập nhật stats
+      this.updateGroupStat(groupId, {
+        lastNewPostCount: newPosts.length,
+        errorCount: 0,
+      });
+
       await page.close();
       return { newPosts, updatedPosts };
     } catch (error) {
       console.error(`[Tab ${tabIndex}] ❌ Lỗi:`, error.message);
       if (page) await page.close();
+
+      // Retry logic
+      if (retryCount < this.maxRetries) {
+        console.log(
+          `[Tab ${tabIndex}] 🔄 Retry ${retryCount + 1}/${this.maxRetries} sau 5s...`
+        );
+        await this.delay(5000);
+        return this.scanGroupInTab(groupId, cookies, tabIndex, retryCount + 1);
+      }
+
+      this.updateGroupStat(groupId, {
+        errorCount: (this.groupStats.get(groupId)?.errorCount || 0) + 1,
+      });
+
       return { newPosts: [], updatedPosts: [] };
     }
   }
@@ -605,13 +734,42 @@ class FacebookGroupMonitor {
       return { newPosts: [], updatedPosts: [] };
     }
 
+    // Filter nhóm cần quét (skip cooldown)
+    const groupsToScan = [];
+    const skippedGroups = [];
+
+    for (const groupId of this.groupIds) {
+      const skipCheck = this.shouldSkipGroup(groupId);
+      if (skipCheck.skip) {
+        skippedGroups.push({ groupId, reason: skipCheck.reason });
+      } else {
+        groupsToScan.push(groupId);
+      }
+    }
+
+    console.log(`\n📊 Tổng: ${this.groupIds.length} nhóm`);
+    console.log(`✅ Cần quét: ${groupsToScan.length} nhóm`);
+    if (skippedGroups.length > 0) {
+      console.log(`⏭️  Skip (cooldown): ${skippedGroups.length} nhóm`);
+      if (skippedGroups.length <= 5) {
+        skippedGroups.forEach(({ groupId, reason }) => {
+          console.log(`   - ${groupId}: ${reason}`);
+        });
+      }
+    }
+
+    if (groupsToScan.length === 0) {
+      console.log("✅ Tất cả nhóm đang trong cooldown!");
+      return { newPosts: [], updatedPosts: [] };
+    }
+
     const allNewPosts = [];
     const allUpdatedPosts = [];
 
     // Chia batch
     const batches = [];
-    for (let i = 0; i < this.groupIds.length; i += this.maxConcurrentTabs) {
-      batches.push(this.groupIds.slice(i, i + this.maxConcurrentTabs));
+    for (let i = 0; i < groupsToScan.length; i += this.maxConcurrentTabs) {
+      batches.push(groupsToScan.slice(i, i + this.maxConcurrentTabs));
     }
 
     console.log(
@@ -651,10 +809,13 @@ class FacebookGroupMonitor {
       );
 
       if (batchIndex < batches.length - 1) {
-        console.log(`\n⏳ Chờ 5s trước batch tiếp theo...`);
-        await this.delay(5000);
+        console.log(`\n⏳ Chờ ${this.batchDelayMs / 1000}s trước batch tiếp theo...`);
+        await this.delay(this.batchDelayMs);
       }
     }
+
+    // Lưu stats sau khi quét xong
+    await this.saveGroupStats();
 
     return { newPosts: allNewPosts, updatedPosts: allUpdatedPosts };
   }
@@ -935,6 +1096,7 @@ async function main() {
     }
 
     await monitor.loadExistingResults();
+    await monitor.loadGroupStats();
 
     console.log("\n" + "=".repeat(60));
     console.log("🔍 BẮT ĐẦU QUÉT (SMART SCROLL + MULTI-TAB)");
@@ -952,6 +1114,7 @@ async function main() {
     );
 
     await monitor.saveResults();
+    await monitor.saveGroupStats();
 
     // Gửi thông báo bài mới
     if (newPosts.length > 0) {

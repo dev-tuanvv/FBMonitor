@@ -11,12 +11,18 @@
         "vinfastevo200",
         "398556705791228"
     ],
-    "maxConcurrentTabs": 5,
+    "maxConcurrentTabs": 10,
     "scrollConfig": {
         "maxScrolls": 30,
         "maxNoNewPosts": 3,
         "scrollWaitMin": 2000,
         "scrollWaitMax": 4000
+    },
+    "performance": {
+        "maxConcurrentTabs": 10,
+        "groupCooldownMinutes": 30,
+        "maxRetries": 2,
+        "batchDelayMs": 3000
     },
     "notification": {
         "telegram": {
