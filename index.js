@@ -12,12 +12,14 @@ class FacebookGroupMonitor {
     this.cookieFile = "fb_cookies.json";
     this.configFile = "config.json";
     this.resultsFile = "results.json";
+    this.cacheIndexFile = "cacheIndexpost.json";
     this.keywords = [];
     this.groupIds = [];
     this.existingResults = new Map();
     this.maxConcurrentTabs = 5;
     this.notificationConfig = null;
     this.groupStats = new Map(); // Lưu thống kê từng nhóm
+    this.latestPostIndex = new Map();
     this.progressFile = "scan_progress.json";
     this.groupCooldownMinutes = 30; // Default cooldown
     this.maxRetries = 2; // Default retries
@@ -34,7 +36,7 @@ class FacebookGroupMonitor {
     console.log("🚀 Đang khởi động browser...");
 
     this.browser = await puppeteer.launch({
-      headless: false,
+      headless: true,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -226,7 +228,7 @@ class FacebookGroupMonitor {
           `✅ Config: ${this.keywords.length} keywords, ${this.groupIds.length} groups`
         );
         console.log(
-          `⚙️  Max tabs: ${this.maxConcurrentTabs}, Max scrolls: ${this.scrollConfig.maxScrolls}`
+          `⚙️  Max tabs: ${this.maxConcurrentTabs}, Stop sau ${this.scrollConfig.maxNoNewPosts} lần không có bài mới`
         );
         return true;
       }
@@ -242,7 +244,7 @@ class FacebookGroupMonitor {
       groupIds: [],
       maxConcurrentTabs: 10, // Tăng lên 10 cho nhiều nhóm
       scrollConfig: {
-        maxScrolls: 30,
+      
         maxNoNewPosts: 3,
         scrollWaitMin: 2000,
         scrollWaitMax: 4000,
@@ -294,6 +296,11 @@ class FacebookGroupMonitor {
   }
 
   // ========== LOAD/SAVE GROUP STATS ==========
+  /**
+   * Hàm này dùng để load (nạp) thống kê quét nhóm (group stats) từ file lưu trữ tiến trình (progressFile).
+   * Nếu file tồn tại, sẽ đọc dữ liệu và gán vào this.groupStats (dạng Map), phục vụ cho việc theo dõi trạng thái quét từng nhóm từ lần thực thi trước.
+   * Trả về true nếu load thành công, ngược lại trả về false và khởi tạo this.groupStats rỗng.
+   */
   async loadGroupStats() {
     try {
       if (await fs.pathExists(this.progressFile)) {
@@ -318,6 +325,36 @@ class FacebookGroupMonitor {
       await fs.writeJson(this.progressFile, data, { spaces: 2 });
     } catch (error) {
       console.error("⚠️ Lỗi save group stats:", error.message);
+    }
+  }
+
+  async loadLatestPostIndex() {
+    try {
+      if (await fs.pathExists(this.cacheIndexFile)) {
+        const data = await fs.readJson(this.cacheIndexFile);
+        const entries = data.posts || data;
+        this.latestPostIndex = new Map(Object.entries(entries || {}));
+        console.log(
+          `📌 Đã load cache post index cho ${this.latestPostIndex.size} nhóm`
+        );
+        return true;
+      }
+    } catch (error) {
+      console.error("⚠️ Lỗi load cache index:", error.message);
+    }
+    this.latestPostIndex = new Map();
+    return false;
+  }
+
+  async saveLatestPostIndex() {
+    try {
+      const data = {
+        lastUpdate: new Date().toISOString(),
+        posts: Object.fromEntries(this.latestPostIndex),
+      };
+      await fs.writeJson(this.cacheIndexFile, data, { spaces: 2 });
+    } catch (error) {
+      console.error("⚠️ Lỗi save cache index:", error.message);
     }
   }
 
@@ -363,10 +400,9 @@ class FacebookGroupMonitor {
     const stat = this.groupStats.get(groupId);
     const baseConfig = { ...this.scrollConfig };
 
-    // Nếu nhóm không có bài mới lần trước, giảm scroll
+    // Nếu nhóm không có bài mới lần trước, giảm số lần cho phép scroll không có kết quả
     if (stat && stat.lastNewPostCount === 0) {
-      baseConfig.maxScrolls = Math.max(10, baseConfig.maxScrolls - 10);
-      baseConfig.maxNoNewPosts = 2; // Dừng sớm hơn
+      baseConfig.maxNoNewPosts = Math.max(1, baseConfig.maxNoNewPosts - 1);
     }
 
     return baseConfig;
@@ -512,6 +548,52 @@ class FacebookGroupMonitor {
 
           if (!postUrl) return;
 
+          let timestamp = null;
+          const timeSelectors = [
+            "abbr[data-utime]",
+            "span[data-utime]",
+            "div[data-utime]",
+            "abbr[data-timestamp]",
+            "span[data-timestamp]",
+            "div[data-timestamp]",
+            "time[datetime]",
+          ];
+
+          for (let sel of timeSelectors) {
+            const timeEl = article.querySelector(sel);
+            if (timeEl) {
+              const utime =
+                timeEl.getAttribute("data-utime") || timeEl.getAttribute("data-timestamp");
+              if (utime) {
+                const numeric = parseInt(utime, 10);
+                if (!isNaN(numeric)) {
+                  timestamp = utime.length === 10 ? numeric * 1000 : numeric;
+                  break;
+                }
+              }
+
+              const datetime = timeEl.getAttribute("datetime");
+              if (datetime) {
+                const parsed = Date.parse(datetime);
+                if (!isNaN(parsed)) {
+                  timestamp = parsed;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (!timestamp) {
+            const timeLink = article.querySelector('a[aria-label*="lúc"], a[aria-label*="at"]');
+            if (timeLink) {
+              const ariaLabel = timeLink.getAttribute("aria-label");
+              const parsed = Date.parse(ariaLabel);
+              if (!isNaN(parsed)) {
+                timestamp = parsed;
+              }
+            }
+          }
+
           // Tên tác giả
           let authorName = "Unknown";
           const nameSelectors = [
@@ -547,6 +629,7 @@ class FacebookGroupMonitor {
             postUrl,
             authorName,
             userId: userId || "unknown",
+            timestamp,
           });
         } catch (e) {
           // Skip
@@ -571,7 +654,7 @@ class FacebookGroupMonitor {
 
       console.log(`\n[Tab ${tabIndex}] 📊 Quét nhóm: ${groupId}`);
 
-      const url = `https://www.facebook.com/groups/${groupId}`;
+      const url = `https://www.facebook.com/groups/${groupId}?sorting_setting=CHRONOLOGICAL`;
 
       await page.goto(url, {
         waitUntil: "networkidle2",
@@ -582,15 +665,11 @@ class FacebookGroupMonitor {
 
       const canAccess = await page.evaluate(() => {
         const bodyText = document.body.innerText;
-        return (
-          !bodyText.includes("Nội dung không khả dụng") &&
-          !bodyText.includes("Content Not Found") &&
-          !bodyText.includes("Tham gia nhóm")
-        );
+        return !bodyText.includes("Bạn hiện không xem được nội dung này");
       });
 
       if (!canAccess) {
-        console.log(`[Tab ${tabIndex}] ⚠️ Không truy cập được nhóm`);
+        console.log(`[Tab ${tabIndex}] ⚠️ Không truy cập được nhóm (ID: ${groupId})`);
         await page.close();
         return { newPosts: [], updatedPosts: [] };
       }
@@ -599,19 +678,33 @@ class FacebookGroupMonitor {
       const updatedPosts = [];
       const processedUrls = new Set();
 
+      const latestKnownPostId = this.latestPostIndex.get(groupId) || null;
+      const hasLatestPostId = Boolean(latestKnownPostId);
+      const threeDaysAgo = Date.now() - 3 * 24 * 60 * 60 * 1000;
+      let latestPostIdThisRun = null;
+      let reachedKnownPost = false;
+      let reachedOldPost = false;
+      let reachedFeedEnd = false;
+
       // ========== SMART SCROLL LOOP ==========
       let noNewPostsCount = 0;
       let scrollCount = 0;
-      // Dùng scroll config tối ưu cho nhóm này
+      let consecutiveEmptyScrolls = 0; // Đếm số lần scroll không có posts mới
       const scrollConfig = this.getScrollConfigForGroup(groupId);
-      const { maxScrolls, maxNoNewPosts, scrollWaitMin, scrollWaitMax } =
-        scrollConfig;
+      const { maxNoNewPosts, scrollWaitMin, scrollWaitMax } = scrollConfig;
 
       console.log(
-        `[Tab ${tabIndex}] 🔄 Bắt đầu smart scroll (max: ${maxScrolls}, stop: ${maxNoNewPosts} lần không có mới)`
+        `[Tab ${tabIndex}] 🔄 Bắt đầu smart scroll (knownLatest: ${
+          hasLatestPostId ? `✅ ${latestKnownPostId}` : "❌"
+        }, stop sau ${maxNoNewPosts} lần không có mới hoặc bài cũ >3 ngày)`
       );
 
-      while (scrollCount < maxScrolls && noNewPostsCount < maxNoNewPosts) {
+      while (
+        noNewPostsCount < maxNoNewPosts &&
+        consecutiveEmptyScrolls < 5 &&
+        !reachedKnownPost &&
+        !reachedOldPost
+      ) {
         scrollCount++;
 
         // Scroll xuống
@@ -619,6 +712,7 @@ class FacebookGroupMonitor {
 
         if (!scrolled) {
           console.log(`[Tab ${tabIndex}]    ⚠️ Đã đến cuối feed`);
+          reachedFeedEnd = true;
           break;
         }
 
@@ -633,65 +727,144 @@ class FacebookGroupMonitor {
         // Lấy tất cả posts hiện tại
         const posts = await this.extractPosts(page);
 
+        if (!posts || posts.length === 0) {
+          consecutiveEmptyScrolls++;
+          console.log(
+            `[Tab ${tabIndex}]    ⚪ Scroll ${scrollCount} - Không có posts nào được extract (${consecutiveEmptyScrolls}/5)`
+          );
+          if (consecutiveEmptyScrolls >= 5) {
+            console.log(`[Tab ${tabIndex}]    ⛔ Quá nhiều scroll không có posts, dừng`);
+            break;
+          }
+          continue;
+        }
+
+        consecutiveEmptyScrolls = 0; // Reset counter khi có posts
+        console.log(
+          `[Tab ${tabIndex}]    📄 Scroll ${scrollCount} - Extract được ${posts.length} bài viết`
+        );
+
         // Process posts
         let foundNewInThisScroll = 0;
+        let foundNewPostsInScroll = false;
 
         for (let post of posts) {
-          // Check trùng và keyword
-          if (!processedUrls.has(post.postUrl)) {
-            processedUrls.add(post.postUrl); // Đánh dấu đã xử lý
+          const postId = this.extractPostId(post.postUrl);
+          if (!postId) continue;
 
-            if (this.hasKeyword(post.text)) {
-              foundNewInThisScroll++;
+          // Lưu post ID đầu tiên làm mốc (không phụ thuộc keywords)
+          if (!latestPostIdThisRun) {
+            latestPostIdThisRun = postId;
+            console.log(
+              `[Tab ${tabIndex}]    📌 Đã lưu mốc post ID đầu tiên: ${postId}`
+            );
+          }
 
-              const newResult = {
-                groupId,
-                postId: this.extractPostId(post.postUrl),
-                userId: post.userId,
-                postUrl: post.postUrl,
-                authorName: post.authorName,
-                textPreview: post.text.substring(0, 300).replace(/\n/g, " "),
-                matchedKeywords: this.getMatchedKeywords(post.text),
-              };
+          // Check nếu gặp lại bài đã lưu
+          if (hasLatestPostId && postId === latestKnownPostId) {
+            reachedKnownPost = true;
+            console.log(
+              `[Tab ${tabIndex}]    ⛔ Đã gặp lại bài viết mới nhất đã lưu (${postId})`
+            );
+            break;
+          }
 
-              const { isNew, result } = this.mergeResult(newResult);
+          // Check bài cũ hơn 3 ngày (chỉ khi chưa có mốc)
+          if (
+            !hasLatestPostId &&
+            post.timestamp &&
+            post.timestamp < threeDaysAgo
+          ) {
+            reachedOldPost = true;
+            const postDate = new Date(post.timestamp).toLocaleString("vi-VN");
+            console.log(
+              `[Tab ${tabIndex}]    ⛔ Gặp bài đăng cũ hơn 3 ngày (${postDate}), dừng`
+            );
+            break;
+          }
 
-              if (isNew) {
-                newPosts.push(result);
-                console.log(
-                  `[Tab ${tabIndex}]    🆕 ${result.authorName} | ${result.postId}`
-                );
-              } else {
-                updatedPosts.push(result);
-                console.log(
-                  `[Tab ${tabIndex}]    🔄 ${result.authorName} | ${result.postId} (#${result.scanCount})`
-                );
-              }
+          // Skip nếu đã xử lý
+          if (processedUrls.has(post.postUrl)) {
+            continue;
+          }
+
+          processedUrls.add(post.postUrl);
+          foundNewPostsInScroll = true;
+
+          // Check keywords và lưu kết quả
+          if (this.hasKeyword(post.text)) {
+            foundNewInThisScroll++;
+
+            const newResult = {
+              groupId,
+              postId,
+              userId: post.userId,
+              postUrl: post.postUrl,
+              authorName: post.authorName,
+              textPreview: post.text.substring(0, 300).replaceAll("\n", " "),
+              matchedKeywords: this.getMatchedKeywords(post.text),
+              timestamp: post.timestamp || null,
+            };
+
+            const { isNew, result } = this.mergeResult(newResult);
+
+            if (isNew) {
+              newPosts.push(result);
+              console.log(
+                `[Tab ${tabIndex}]    🆕 ${result.authorName} | ${result.postId}`
+              );
+            } else {
+              updatedPosts.push(result);
+              console.log(
+                `[Tab ${tabIndex}]    🔄 ${result.authorName} | ${result.postId} (#${result.scanCount})`
+              );
             }
           }
         }
 
-        // Check xem có bài mới không
-        if (foundNewInThisScroll === 0) {
+        if (reachedKnownPost || reachedOldPost) {
+          break;
+        }
+
+        // Check xem có bài mới không (có bài mới nhưng không match keywords vẫn reset counter)
+        if (!foundNewPostsInScroll) {
           noNewPostsCount++;
           console.log(
-            `[Tab ${tabIndex}]    ⚪ Scroll ${scrollCount}/${maxScrolls} - Không có bài mới (${noNewPostsCount}/${maxNoNewPosts})`
+            `[Tab ${tabIndex}]    ⚪ Scroll ${scrollCount} - Không có bài mới chưa xử lý (${noNewPostsCount}/${maxNoNewPosts})`
           );
         } else {
-          noNewPostsCount = 0; // Reset counter
-          console.log(
-            `[Tab ${tabIndex}]    ✅ Scroll ${scrollCount}/${maxScrolls} - Tìm thấy ${foundNewInThisScroll} bài phù hợp | Tổng: ${newPosts.length} mới, ${updatedPosts.length} update`
-          );
+          if (foundNewInThisScroll === 0) {
+            // Có bài mới nhưng không match keywords - vẫn reset counter
+            noNewPostsCount = 0;
+            console.log(
+              `[Tab ${tabIndex}]    ⚪ Scroll ${scrollCount} - Có ${posts.length} bài nhưng không match keywords`
+            );
+          } else {
+            noNewPostsCount = 0; // Reset counter khi có bài match keywords
+            console.log(
+              `[Tab ${tabIndex}]    ✅ Scroll ${scrollCount} - Tìm thấy ${foundNewInThisScroll} bài phù hợp | Tổng: ${newPosts.length} mới, ${updatedPosts.length} update`
+            );
+          }
         }
       }
 
       // Summary
-      if (noNewPostsCount >= maxNoNewPosts) {
+      if (reachedKnownPost) {
+        console.log(
+          `[Tab ${tabIndex}] ⏹️  Dừng: Gặp bài viết mới nhất đã lưu (${latestKnownPostId})`
+        );
+      } else if (reachedOldPost) {
+        console.log(
+          `[Tab ${tabIndex}] ⏹️  Dừng: Gặp bài đăng cũ hơn 3 ngày`
+        );
+      } else if (reachedFeedEnd) {
+        console.log(
+          `[Tab ${tabIndex}] ⏹️  Dừng: Đã tới cuối feed nhóm`
+        );
+      } else if (noNewPostsCount >= maxNoNewPosts) {
         console.log(
           `[Tab ${tabIndex}] ⏹️  Dừng: ${maxNoNewPosts} lần không có bài mới`
         );
-      } else if (scrollCount >= maxScrolls) {
-        console.log(`[Tab ${tabIndex}] ⏹️  Dừng: Đã đạt ${maxScrolls} scrolls`);
       }
 
       console.log(
@@ -699,15 +872,31 @@ class FacebookGroupMonitor {
       );
 
       // Cập nhật stats
-      this.updateGroupStat(groupId, {
+      const nextStat = {
         lastNewPostCount: newPosts.length,
         errorCount: 0,
-      });
+      };
+
+      this.updateGroupStat(groupId, nextStat);
+
+      // Luôn lưu latestPostId nếu có (làm mốc cho lần quét sau)
+      if (latestPostIdThisRun) {
+        this.latestPostIndex.set(groupId, latestPostIdThisRun);
+        console.log(
+          `[Tab ${tabIndex}] 💾 Đã lưu mốc post ID cho nhóm ${groupId}: ${latestPostIdThisRun}`
+        );
+      } else {
+        console.log(
+          `[Tab ${tabIndex}] ⚠️ Không có post ID nào để lưu mốc cho nhóm ${groupId}`
+        );
+      }
 
       await page.close();
       return { newPosts, updatedPosts };
     } catch (error) {
-      console.error(`[Tab ${tabIndex}] ❌ Lỗi:`, error.message);
+      console.error(
+        `[Tab ${tabIndex}] ❌ Lỗi khi quét group ${groupId}: ${error.message}`
+      );
       if (page) await page.close();
 
       // Retry logic
@@ -960,9 +1149,10 @@ class FacebookGroupMonitor {
   // ========== FORMAT MESSAGE ==========
   formatPostMessage(post, platform = "telegram") {
     const keywords = post.matchedKeywords.join(", ");
-    const preview = post.textPreview.length > 500 
-      ? post.textPreview.substring(0, 500) + "..." 
-      : post.textPreview;
+    const preview =
+      post.textPreview.length > 500
+        ? post.textPreview.substring(0, 500) + "..."
+        : post.textPreview;
 
     if (platform === "telegram") {
       // Format cho Telegram (HTML)
@@ -974,7 +1164,7 @@ class FacebookGroupMonitor {
 🔍 <b>Từ khóa:</b> ${keywords}
 
 📝 <b>Nội dung:</b>
-${preview.replace(/</g, "&lt;").replace(/>/g, "&gt;")}
+${preview.replaceAll("<", "&lt;").replaceAll(">", "&gt;")}
 
 🔗 <a href="${post.postUrl}">Xem bài viết</a>
 `;
@@ -1097,6 +1287,7 @@ async function main() {
 
     await monitor.loadExistingResults();
     await monitor.loadGroupStats();
+    await monitor.loadLatestPostIndex();
 
     console.log("\n" + "=".repeat(60));
     console.log("🔍 BẮT ĐẦU QUÉT (SMART SCROLL + MULTI-TAB)");
@@ -1105,7 +1296,7 @@ async function main() {
     console.log(`📂 Tổng: ${monitor.groupIds.length} nhóm`);
     console.log(`🖥️  Max tabs: ${monitor.maxConcurrentTabs} tabs/batch`);
     console.log(
-      `🔄 Scroll: max ${monitor.scrollConfig.maxScrolls}, stop sau ${monitor.scrollConfig.maxNoNewPosts} lần không có mới`
+      `🔄 Scroll: Stop sau ${monitor.scrollConfig.maxNoNewPosts} lần không có bài mới / gặp bài đã lưu / bài cũ hơn 3 ngày`
     );
     console.log("=".repeat(60));
 
@@ -1115,6 +1306,7 @@ async function main() {
 
     await monitor.saveResults();
     await monitor.saveGroupStats();
+    await monitor.saveLatestPostIndex();
 
     // Gửi thông báo bài mới
     if (newPosts.length > 0) {
