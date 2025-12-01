@@ -5,6 +5,34 @@ const axios = require("axios");
 
 puppeteer.use(StealthPlugin());
 
+// ========== CONSTANTS ==========
+const CONSTANTS = {
+  DELAYS: {
+    CHECK_LOGIN: 3000,
+    PAGE_LOAD: 3000,
+    RETRY: 5000,
+    NOTIFICATION: 1000,
+    BATCH_DEFAULT: 3000,
+  },
+  TIMEOUTS: {
+    PAGE_NAVIGATION: 60000,
+    LOGIN_CHECK: 30000,
+    CONTENT_WAIT: 5000,
+    ARTICLES_WAIT: 3000,
+  },
+  SCROLL: {
+    MAX_EMPTY_SCROLLS: 5,
+    SCROLL_RATIO: 0.8,
+    SCROLL_THRESHOLD: 100,
+  },
+  POST: {
+    MAX_PREVIEW_LENGTH: 300,
+    MAX_MESSAGE_LENGTH: 500,
+    OLD_POST_DAYS: 3,
+  },
+  USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+};
+
 class FacebookGroupMonitor {
   constructor() {
     this.browser = null;
@@ -16,6 +44,7 @@ class FacebookGroupMonitor {
     this.cacheIndexFile = "cacheIndexpost.json";
 
     this.keywords = [];
+    this.keywordsSet = null; // Cache for fast lookup
     this.groupIds = [];
     this.existingResults = new Map();
 
@@ -39,22 +68,31 @@ class FacebookGroupMonitor {
 
   async initBrowser() {
     console.log("Dang khoi dong browser...");
-    this.browser = await puppeteer.launch({
-      headless: true,
-      args: [
+    
+    const launchArgs = [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--lang=vi-VN",
         "--disable-features=IsolateOrigins,site-per-process",
-      ],
-      defaultViewport: null,
-    });
+        "--disable-dev-shm-usage",
+    ];
 
+    try {
+        console.log("Dang khoi dong browser...");
+        this.browser = await puppeteer.launch({
+            headless: true,
+            args: launchArgs,
+            defaultViewport: null,
+            ignoreHTTPSErrors: true,
+        });
+    } catch (error) {
+        console.log(`Loi khoi dong browser: ${error.message}`);
+        throw error;
+    }
+    
     this.mainPage = await this.browser.newPage();
-    await this.mainPage.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    );
+    await this.mainPage.setUserAgent(CONSTANTS.USER_AGENT);
 
     console.log("Browser da san sang");
   }
@@ -116,10 +154,10 @@ class FacebookGroupMonitor {
     try {
       await this.mainPage.goto("https://www.facebook.com", {
         waitUntil: "networkidle2",
-        timeout: 30000,
+        timeout: CONSTANTS.TIMEOUTS.LOGIN_CHECK,
       });
 
-      await this.delay(3000);
+      await this.delay(CONSTANTS.DELAYS.CHECK_LOGIN);
 
       const hasLoginForm = await this.mainPage.evaluate(() => {
         return !!document.querySelector('input[name="email"]');
@@ -195,6 +233,7 @@ class FacebookGroupMonitor {
         const config = await fs.readJson(this.configFile);
 
         this.keywords = config.keywords || [];
+        this.keywordsSet = new Set(this.keywords.map(kw => kw.toLowerCase()));
         this.groupIds = config.groupIds || [];
         this.maxConcurrentTabs = config.maxConcurrentTabs || 5;
 
@@ -269,6 +308,7 @@ class FacebookGroupMonitor {
 
     await fs.writeJson(this.configFile, config, { spaces: 2 });
     this.keywords = config.keywords;
+    this.keywordsSet = new Set(this.keywords.map(kw => kw.toLowerCase()));
     this.groupIds = config.groupIds;
     console.log(`Da tao config mac dinh: ${this.configFile}`);
   }
@@ -358,15 +398,26 @@ class FacebookGroupMonitor {
     return baseConfig;
   }
 
+  updateGroupStat(groupId, updates) {
+    const current = this.groupStats.get(groupId) || {};
+    this.groupStats.set(groupId, {
+      ...current,
+      ...updates,
+      lastScan: updates.lastScan || current.lastScan || new Date().toISOString(),
+    });
+  }
+
   mergeResult(newResult) {
+    const now = new Date().toISOString();
     const existingResult = this.existingResults.get(newResult.postUrl);
+    
     if (existingResult) {
       const updated = {
         ...existingResult,
         textPreview: newResult.textPreview,
         matchedKeywords: newResult.matchedKeywords,
-        lastUpdated: new Date().toISOString(),
-        lastSeen: new Date().toISOString(),
+        lastUpdated: now,
+        lastSeen: now,
         scanCount: (existingResult.scanCount || 1) + 1,
       };
       this.existingResults.set(newResult.postUrl, updated);
@@ -374,9 +425,9 @@ class FacebookGroupMonitor {
     } else {
       const created = {
         ...newResult,
-        firstSeen: new Date().toISOString(),
-        lastSeen: new Date().toISOString(),
-        lastUpdated: new Date().toISOString(),
+        firstSeen: now,
+        lastSeen: now,
+        lastUpdated: now,
         scanCount: 1,
       };
       this.existingResults.set(newResult.postUrl, created);
@@ -385,14 +436,15 @@ class FacebookGroupMonitor {
   }
 
   hasKeyword(text) {
-    if (!text) return false;
+    if (!text || !this.keywordsSet) return false;
     const lowerText = text.toLowerCase();
-    return this.keywords.some((kw) => lowerText.includes(kw.toLowerCase()));
+    return Array.from(this.keywordsSet).some((kw) => lowerText.includes(kw));
   }
 
   getMatchedKeywords(text) {
+    if (!text || !this.keywordsSet) return [];
     const lowerText = text.toLowerCase();
-    return this.keywords.filter((kw) => lowerText.includes(kw.toLowerCase()));
+    return Array.from(this.keywordsSet).filter((kw) => lowerText.includes(kw));
   }
 
   extractPostId(url) {
@@ -412,16 +464,16 @@ class FacebookGroupMonitor {
   // ========== SMART SCROLL ==========
 
   async smartScroll(page) {
-    return await page.evaluate(() => {
+    return await page.evaluate((SCROLL_RATIO, SCROLL_THRESHOLD) => {
       const scrollBefore = window.pageYOffset;
       const scrollHeight = document.documentElement.scrollHeight;
       const clientHeight = document.documentElement.clientHeight;
 
-      window.scrollBy(0, clientHeight * 0.8);
+      window.scrollBy(0, clientHeight * SCROLL_RATIO);
 
       const scrollAfter = window.pageYOffset;
 
-      if (scrollAfter + clientHeight >= scrollHeight - 100) {
+      if (scrollAfter + clientHeight >= scrollHeight - SCROLL_THRESHOLD) {
         return false;
       }
 
@@ -430,18 +482,18 @@ class FacebookGroupMonitor {
       }
 
       return true;
-    });
+    }, CONSTANTS.SCROLL.SCROLL_RATIO, CONSTANTS.SCROLL.SCROLL_THRESHOLD);
   }
 
   async waitForNewContent(page) {
     try {
-      await page
+        await page
         .waitForFunction(
           () => {
             const spinners = document.querySelectorAll('[role="progressbar"]');
             return spinners.length === 0;
           },
-          { timeout: 5000 }
+          { timeout: CONSTANTS.TIMEOUTS.CONTENT_WAIT }
         )
         .catch(() => {});
 
@@ -451,7 +503,7 @@ class FacebookGroupMonitor {
             const articles = document.querySelectorAll('[role="article"]');
             return articles.length > 0;
           },
-          { timeout: 3000 }
+          { timeout: CONSTANTS.TIMEOUTS.ARTICLES_WAIT }
         )
         .catch(() => {});
     } catch (error) {
@@ -461,10 +513,16 @@ class FacebookGroupMonitor {
 
   async extractPosts(page) {
     return await page.evaluate(() => {
-      const articles = document.querySelectorAll('[role="article"]');
+      // Chon tat ca article chua duoc scan
+      const articles = document.querySelectorAll(
+        '[role="article"]:not([data-monitor-scanned="true"])'
+      );
       const data = [];
 
       articles.forEach((article) => {
+        // Danh dau da scan de lan sau bo qua
+        article.setAttribute("data-monitor-scanned", "true");
+
         try {
           const text = article.innerText || "";
 
@@ -581,10 +639,24 @@ class FacebookGroupMonitor {
     let page = null;
     try {
       page = await this.browser.newPage();
+      
+      // Optimize: Block unnecessary resources (images, media, fonts)
+      await page.setRequestInterception(true);
+      page.on("request", (req) => {
+        const resourceType = req.resourceType();
+        if (
+          resourceType === "image" ||
+          resourceType === "media" ||
+          resourceType === "font"
+        ) {
+          req.abort();
+        } else {
+          req.continue();
+        }
+      });
+
       await page.setCookie(...cookies);
-      await page.setUserAgent(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-      );
+      await page.setUserAgent(CONSTANTS.USER_AGENT);
 
       console.log(`\n[Tab ${tabIndex}] Quet nhom: ${groupId}`);
 
@@ -592,10 +664,10 @@ class FacebookGroupMonitor {
 
       await page.goto(url, {
         waitUntil: "networkidle2",
-        timeout: 60000,
+        timeout: CONSTANTS.TIMEOUTS.PAGE_NAVIGATION,
       });
 
-      await this.delay(3000);
+      await this.delay(CONSTANTS.DELAYS.PAGE_LOAD);
 
       const canAccess = await page.evaluate(() => {
         const bodyText = document.body.innerText;
@@ -617,7 +689,7 @@ class FacebookGroupMonitor {
       const latestKnownPostId = this.latestPostIndex.get(groupId) || null;
       const hasLatestPostId = Boolean(latestKnownPostId);
 
-      const threeDaysAgo = Date.now() - 3 * 24 * 60 * 60 * 1000;
+      const threeDaysAgo = Date.now() - CONSTANTS.POST.OLD_POST_DAYS * 24 * 60 * 60 * 1000;
 
       let latestPostIdThisRun = null;
       let reachedKnownPost = false;
@@ -639,7 +711,7 @@ class FacebookGroupMonitor {
 
       while (
         noNewPostsCount < maxNoNewPosts &&
-        consecutiveEmptyScrolls < 5 &&
+        consecutiveEmptyScrolls < CONSTANTS.SCROLL.MAX_EMPTY_SCROLLS &&
         !reachedKnownPost &&
         !reachedOldPost
       ) {
@@ -664,7 +736,7 @@ class FacebookGroupMonitor {
           console.log(
             `[Tab ${tabIndex}] Scroll ${scrollCount} - Khong co post nao (empty ${consecutiveEmptyScrolls}/5)`
           );
-          if (consecutiveEmptyScrolls >= 5) {
+          if (consecutiveEmptyScrolls >= CONSTANTS.SCROLL.MAX_EMPTY_SCROLLS) {
             console.log(
               `[Tab ${tabIndex}] Qua nhieu scroll khong co posts, dung`
             );
@@ -728,7 +800,7 @@ class FacebookGroupMonitor {
               userId: post.userId,
               postUrl: post.postUrl,
               authorName: post.authorName,
-              textPreview: post.text.substring(0, 300).replaceAll("\n", " "),
+              textPreview: post.text.substring(0, CONSTANTS.POST.MAX_PREVIEW_LENGTH).replaceAll("\n", " "),
               matchedKeywords: this.getMatchedKeywords(post.text),
               timestamp: post.timestamp || null,
             };
@@ -791,10 +863,11 @@ class FacebookGroupMonitor {
         `[Tab ${tabIndex}] Hoan thanh - New: ${newPosts.length}, Update: ${updatedPosts.length} (${scrollCount} scroll, ${processedUrls.size} posts)`
       );
 
-      const nextStat = {
+      this.updateGroupStat(groupId, {
         lastNewPostCount: newPosts.length,
         errorCount: 0,
-      };
+        lastScan: new Date().toISOString(),
+      });
 
       if (latestPostIdThisRun) {
         this.latestPostIndex.set(groupId, latestPostIdThisRun);
@@ -822,12 +895,13 @@ class FacebookGroupMonitor {
             this.maxRetries
           } sau 5s...`
         );
-        await this.delay(5000);
+        await this.delay(CONSTANTS.DELAYS.RETRY);
         return this.scanGroupInTab(groupId, cookies, tabIndex, retryCount + 1);
       }
 
       this.updateGroupStat(groupId, {
         errorCount: (this.groupStats.get(groupId)?.errorCount || 0) + 1,
+        lastScan: new Date().toISOString(),
       });
 
       return { newPosts: [], updatedPosts: [] };
@@ -915,7 +989,7 @@ class FacebookGroupMonitor {
         console.log(
           `\nCho ${this.batchDelayMs / 1000}s truoc batch tiep theo...`
         );
-        await this.delay(this.batchDelayMs);
+        await this.delay(this.batchDelayMs || CONSTANTS.DELAYS.BATCH_DEFAULT);
       }
     }
     return { newPosts: allNewPosts, updatedPosts: allUpdatedPosts };
@@ -1041,13 +1115,13 @@ class FacebookGroupMonitor {
       if (this.notificationConfig.telegram?.enabled) {
         const telegramMessage = this.formatPostMessage(post, "telegram");
         await this.sendToTelegram(telegramMessage);
-        await this.delay(1000);
+        await this.delay(CONSTANTS.DELAYS.NOTIFICATION);
       }
 
       if (this.notificationConfig.zalo?.enabled) {
         const zaloMessage = this.formatPostMessage(post, "zalo");
         await this.sendToZalo(zaloMessage);
-        await this.delay(1000);
+        await this.delay(CONSTANTS.DELAYS.NOTIFICATION);
       }
     }
 
@@ -1057,8 +1131,8 @@ class FacebookGroupMonitor {
   formatPostMessage(post, platform = "telegram") {
     const keywords = post.matchedKeywords.join(", ");
     const preview =
-      post.textPreview.length > 500
-        ? post.textPreview.substring(0, 500) + "..."
+      post.textPreview.length > CONSTANTS.POST.MAX_MESSAGE_LENGTH
+        ? post.textPreview.substring(0, CONSTANTS.POST.MAX_MESSAGE_LENGTH) + "..."
         : post.textPreview;
 
     if (platform === "telegram") {
