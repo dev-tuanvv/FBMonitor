@@ -2,8 +2,77 @@ const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const fs = require("fs-extra");
 const axios = require("axios");
+const { google } = require("googleapis");
 
 puppeteer.use(StealthPlugin());
+
+// ========== GOOGLE SHEET SERVICE ==========
+class GoogleSheetService {
+  constructor(config) {
+    this.enabled = config?.enabled || false;
+    this.sheetId = config?.sheetId;
+    this.keyFile = config?.serviceAccountKeyFile;
+    this.auth = null;
+    this.sheets = null;
+  }
+
+  async init() {
+    if (!this.enabled || !this.sheetId || !this.keyFile) {
+      return false;
+    }
+
+    try {
+      if (!(await fs.pathExists(this.keyFile))) {
+        console.log(`[Google Sheet] Khong tim thay key file: ${this.keyFile}`);
+        return false;
+      }
+
+      this.auth = new google.auth.GoogleAuth({
+        keyFile: this.keyFile,
+        scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+      });
+
+      const client = await this.auth.getClient();
+      this.sheets = google.sheets({ version: "v4", auth: client });
+      console.log("[Google Sheet] Da ket noi thanh cong");
+      return true;
+    } catch (error) {
+      console.error("[Google Sheet] Loi ket noi:", error.message);
+      return false;
+    }
+  }
+
+  async export(posts) {
+    if (!this.sheets || !this.sheetId || posts.length === 0) return;
+
+    try {
+      const values = posts.map((post) => [
+        new Date().toLocaleString("vi-VN"), // Thoi gian quet
+        post.groupId,
+        post.authorName,
+        post.postUrl,
+        post.matchedKeywords.join(", "),
+        post.textPreview,
+        post.timestamp
+          ? new Date(post.timestamp).toLocaleString("vi-VN")
+          : "Unknown",
+      ]);
+
+      await this.sheets.spreadsheets.values.append({
+        spreadsheetId: this.sheetId,
+        range: "A1", // Append vao sheet dau tien
+        valueInputOption: "USER_ENTERED",
+        resource: {
+          values: values,
+        },
+      });
+
+      console.log(`[Google Sheet] Da them ${posts.length} dong moi`);
+    } catch (error) {
+      console.error("[Google Sheet] Loi khi ghi du lieu:", error.message);
+    }
+  }
+}
 
 // ========== CONSTANTS ==========
 const CONSTANTS = {
@@ -50,6 +119,7 @@ class FacebookGroupMonitor {
 
     this.maxConcurrentTabs = 5;
     this.notificationConfig = null;
+    this.sheetService = null; // Google Sheet Service
 
     this.groupStats = new Map(); // thong ke tung nhom
     this.latestPostIndex = new Map();
@@ -243,6 +313,13 @@ class FacebookGroupMonitor {
 
         if (config.notification) {
           this.notificationConfig = config.notification;
+          // Init Google Sheet Service
+          if (config.notification.googleSheet) {
+            this.sheetService = new GoogleSheetService(
+              config.notification.googleSheet
+            );
+            await this.sheetService.init();
+          }
         }
 
         if (config.performance) {
@@ -1126,6 +1203,11 @@ class FacebookGroupMonitor {
     }
 
     console.log(`Da gui ${newPosts.length} bai moi`);
+
+    // Export to Google Sheet if enabled
+    if (this.sheetService) {
+      await this.sheetService.export(newPosts);
+    }
   }
 
   formatPostMessage(post, platform = "telegram") {

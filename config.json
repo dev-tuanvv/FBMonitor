@@ -1,40 +1,45 @@
 {
-    "keywords": [
-        "mua",
-        "bán",
-        "cần tìm",
-        "thanh lý",
-        "giá rẻ",
-        "ship cod"
-    ],
-    "groupIds": [
-        "vinfastevo200",
-        "398556705791228"
-    ],
+  "keywords": [
+    "mua",
+    "bán",
+    "cần tìm",
+    "thanh lý",
+    "giá rẻ",
+    "ship cod"
+  ],
+  "groupIds": [
+    "vinfastevo200",
+    "398556705791228"
+  ],
+  "maxConcurrentTabs": 10,
+  "scrollConfig": {
+    "maxScrolls": 30,
+    "maxNoNewPosts": 3,
+    "scrollWaitMin": 2000,
+    "scrollWaitMax": 4000
+  },
+  "performance": {
     "maxConcurrentTabs": 10,
-    "scrollConfig": {
-        "maxScrolls": 30,
-        "maxNoNewPosts": 3,
-        "scrollWaitMin": 2000,
-        "scrollWaitMax": 4000
+    "groupCooldownMinutes": 30,
+    "maxRetries": 2,
+    "batchDelayMs": 3000
+  },
+  "notification": {
+    "telegram": {
+      "enabled": false,
+      "botToken": "",
+      "chatId": ""
     },
-    "performance": {
-        "maxConcurrentTabs": 10,
-        "groupCooldownMinutes": 30,
-        "maxRetries": 2,
-        "batchDelayMs": 3000
+    "zalo": {
+      "enabled": false,
+      "accessToken": "",
+      "groupId": "",
+      "webhookUrl": ""
     },
-    "notification": {
-        "telegram": {
-            "enabled": false,
-            "botToken": "",
-            "chatId": ""
-        },
-        "zalo": {
-            "enabled": false,
-            "accessToken": "",
-            "groupId": "",
-            "webhookUrl": ""
-        }
+    "googleSheet": {
+      "enabled": true,
+      "sheetId": "1CRea_CZtRmlrWjLoiJWYN9v7xAA8lKcBjZO7ai-ceTs",
+      "serviceAccountKeyFile": "service_account.json"
     }
+  }
 }

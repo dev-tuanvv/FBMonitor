@@ -5,6 +5,11 @@
 /.pnp
 .pnp.js
 fb_cookies.json
+service_account.json
+results.json
+cacheIndexpost.json
+temp_user_data/
+test_google_sheet.js
 
 # testing
 /coverage
