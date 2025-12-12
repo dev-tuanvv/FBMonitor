@@ -113,10 +113,8 @@ async function refreshCookies(mainPage, cookieFile) {
 
     await fs.writeJson(
       cookieFile,
-      {
-        cookies: cookieEditorFormat,
-        lastUpdate: new Date().toISOString(),
-      },
+      cookieEditorFormat
+      ,
       { spaces: 2 }
     );
 
