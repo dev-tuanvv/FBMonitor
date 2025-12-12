@@ -687,6 +687,18 @@ class FacebookGroupMonitor {
         let foundNewPostsInScroll = false;
 
         for (let post of posts) {
+          const selector = 'a .x1rg5ohu.x6ikm8r.x10wlt62.x16dsc37.xt0b8zv';
+          await page.waitForSelector(selector);
+          await page.hover(selector);
+
+          // đợi tooltip
+          await page.waitForSelector('[role="tooltip"]', { visible: true });
+
+          // lấy text tooltip
+          const text = await page.$eval('[role="tooltip"]', el => el.textContent.trim());
+
+          console.log("Tooltip:", text);
+
           const postId = this.extractPostId(post.postUrl);
           if (!postId) continue;
 
@@ -1168,8 +1180,8 @@ async function main() {
     console.log("=".repeat(60) + "\n");
 
     await monitor.initBrowser();
-
-    const cookies = await monitor.loadCookiesFromFile();
+  
+    const cookies = await monitor.mainPage.cookies();
     if (!cookies) {
       console.log("\nKhong load duoc cookies\n");
       await monitor.close();
