@@ -3,6 +3,7 @@ const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const fs = require("fs-extra");
 const axios = require("axios");
 const { google } = require("googleapis");
+const cookBrowser = require("./cook_browser");
 
 puppeteer.use(StealthPlugin());
 
@@ -137,164 +138,21 @@ class FacebookGroupMonitor {
   }
 
   async initBrowser() {
-    console.log("Dang khoi dong browser...");
-    
-    const launchArgs = [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-blink-features=AutomationControlled",
-        "--lang=vi-VN",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--disable-dev-shm-usage",
-    ];
-
-    try {
-        console.log("Dang khoi dong browser...");
-        this.browser = await puppeteer.launch({
-            headless: true,
-            args: launchArgs,
-            defaultViewport: null,
-            ignoreHTTPSErrors: true,
-        });
-    } catch (error) {
-        console.log(`Loi khoi dong browser: ${error.message}`);
-        throw error;
-    }
-    
-    this.mainPage = await this.browser.newPage();
-    await this.mainPage.setUserAgent(CONSTANTS.USER_AGENT);
-
-    console.log("Browser da san sang");
-  }
-
-  async createCookieTemplate() {
-    const template = {
-      _comment: "Paste cookie tu Cookie Editor vao day",
-      cookies: [],
-    };
-
-    await fs.writeJson(this.cookieFile, template, { spaces: 2 });
-    console.log(`Da tao file mau: ${this.cookieFile}`);
-  }
-
-  async loadCookiesFromFile() {
-    try {
-      if (!(await fs.pathExists(this.cookieFile))) {
-        console.log("Khong tim thay fb_cookies.json");
-        await this.createCookieTemplate();
-        return false;
-      }
-
-      let data = await fs.readJson(this.cookieFile);
-      let cookies = Array.isArray(data) ? data : data.cookies || [];
-      if (cookies.length === 0) {
-        console.log("Mang cookies rong!");
-        return false;
-      }
-
-      cookies = cookies.map((cookie) => ({
-        name: cookie.name,
-        value: cookie.value,
-        domain: cookie.domain,
-        path: cookie.path || "/",
-        expires: cookie.expirationDate || -1,
-        httpOnly: cookie.httpOnly || false,
-        secure: cookie.secure || false,
-        sameSite: this.convertSameSite(cookie.sameSite),
-      }));
-
-      await this.mainPage.setCookie(...cookies);
-      console.log(`Da load ${cookies.length} cookies`);
-      return cookies;
-    } catch (error) {
-      console.error("Loi khi doc cookie:", error.message);
-      return false;
-    }
+    const { browser, mainPage } = await cookBrowser.initBrowser(CONSTANTS, this.cookieFile);
+    this.browser = browser;
+    this.mainPage = mainPage;
   }
 
   convertSameSite(sameSite) {
-    if (!sameSite || sameSite === "no_restriction") return "None";
-    if (sameSite === "lax") return "Lax";
-    if (sameSite === "strict") return "Strict";
-    return "Lax";
+    return cookBrowser.convertSameSite(sameSite);
   }
 
   async checkLogin() {
-    console.log("Kiem tra dang nhap...");
-    try {
-      await this.mainPage.goto("https://www.facebook.com", {
-        waitUntil: "networkidle2",
-        timeout: CONSTANTS.TIMEOUTS.LOGIN_CHECK,
-      });
-
-      await this.delay(CONSTANTS.DELAYS.CHECK_LOGIN);
-
-      const hasLoginForm = await this.mainPage.evaluate(() => {
-        return !!document.querySelector('input[name="email"]');
-      });
-
-      if (hasLoginForm) {
-        console.log("Cookie khong hop le (hien form login)");
-        return false;
-      }
-
-      const userInfo = await this.mainPage.evaluate(() => {
-        const cUserCookie = document.cookie
-          .split(";")
-          .find((c) => c.includes("c_user="));
-        const userId = cUserCookie ? cUserCookie.split("=")[1].trim() : null;
-        return { userId };
-      });
-
-      if (userInfo.userId) {
-        console.log(`Dang nhap thanh cong, userId: ${userInfo.userId}`);
-        return true;
-      }
-
-      console.log("Da dang nhap (khong tim thay userId cu the)");
-      return true;
-    } catch (error) {
-      console.error("Loi check login:", error.message);
-      return false;
-    }
+    return await cookBrowser.checkLogin(this.mainPage, CONSTANTS);
   }
 
   async refreshCookies() {
-    console.log("Refresh cookies...");
-    try {
-      const newCookies = await this.mainPage.cookies();
-
-      const cookieEditorFormat = newCookies.map((cookie) => ({
-        domain: cookie.domain,
-        expirationDate: cookie.expires,
-        hostOnly: false,
-        httpOnly: cookie.httpOnly,
-        name: cookie.name,
-        path: cookie.path,
-        sameSite:
-          cookie.sameSite === "None"
-            ? "no_restriction"
-            : (cookie.sameSite || "lax").toLowerCase(),
-        secure: cookie.secure,
-        session: cookie.expires === -1,
-        value: cookie.value,
-      }));
-
-      await fs.writeJson(
-        this.cookieFile,
-        {
-          cookies: cookieEditorFormat,
-          lastUpdate: new Date().toISOString(),
-        },
-        { spaces: 2 }
-      );
-
-      console.log("Cookies da duoc refresh");
-      return true;
-    } catch (error) {
-      console.error("Khong the refresh cookies:", error.message);
-      return false;
-    }
+    return await cookBrowser.refreshCookies(this.mainPage, this.cookieFile);
   }
 
   async loadConfig() {
@@ -410,8 +268,6 @@ class FacebookGroupMonitor {
     return false;
   }
 
-  // ========== GROUP STATS ==========
-
   async loadLatestPostIndex() {
     try {
       if (await fs.pathExists(this.cacheIndexFile)) {
@@ -468,7 +324,7 @@ class FacebookGroupMonitor {
     const stat = this.groupStats.get(groupId);
     const baseConfig = { ...this.scrollConfig };
 
-    if (stat && stat.lastNewPostCount === 0) {
+    if (stat?.lastNewPostCount === 0) {
       baseConfig.maxNoNewPosts = Math.max(1, baseConfig.maxNoNewPosts - 1);
     }
 
